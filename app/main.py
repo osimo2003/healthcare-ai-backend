@@ -19,6 +19,7 @@ models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
+# ✅ CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -40,6 +41,10 @@ headers = {
 LLM_MODEL = "llama-3.1-8b-instant"
 
 
+# =============================
+# DATABASE DEPENDENCY
+# =============================
+
 def get_db():
     db = SessionLocal()
     try:
@@ -47,6 +52,10 @@ def get_db():
     finally:
         db.close()
 
+
+# =============================
+# REQUEST MODELS
+# =============================
 
 class RegisterRequest(BaseModel):
     username: str
@@ -67,6 +76,10 @@ class AppointmentRequest(BaseModel):
     appointment_time: str
     recurring: str = "none"
 
+
+# =============================
+# AUTH ENDPOINTS
+# =============================
 
 @app.post("/register")
 def register(request: RegisterRequest, db: Session = Depends(get_db)):
@@ -97,14 +110,48 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+# =============================
+# CHAT (HEALTHCARE ONLY)
+# =============================
+
 @app.post("/chat")
 async def chat(request: ChatRequest, username: str = Depends(verify_token)):
 
     user_message = request.message
 
+    # ✅ Strict Healthcare Restriction
+    healthcare_keywords = [
+        "health", "medical", "doctor", "hospital", "symptom",
+        "pain", "disease", "condition", "treatment", "medicine",
+        "appointment", "nhs", "mental health", "therapy",
+        "blood", "pressure", "diabetes", "asthma",
+        "infection", "injury", "emergency", "fever",
+        "headache", "breathing", "heart", "stroke",
+        "anxiety", "depression", "injury"
+    ]
+
+    if not any(keyword in user_message.lower() for keyword in healthcare_keywords):
+        return {
+            "response": (
+                "I am a healthcare assistant and can only respond to medical or healthcare-related questions.\n\n"
+                "For non-health-related inquiries, please use a general-purpose assistant or search engine."
+            ),
+            "sources": [],
+            "confidence": "Not Applicable",
+            "emergency": False
+        }
+
+    # ✅ Retrieve NHS Context
     context_docs = llm_select_documents(user_message)
     context_text = "\n\n".join(context_docs)
 
+    # ✅ Detect if user wants detailed explanation
+    detailed_request = any(
+        phrase in user_message.lower()
+        for phrase in ["explain in detail", "more detail", "full explanation", "elaborate"]
+    )
+
+    # ✅ LLM Call
     response = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers=headers,
@@ -114,14 +161,25 @@ async def chat(request: ChatRequest, username: str = Depends(verify_token)):
                 {
                     "role": "system",
                     "content": f"""
-You are a responsible healthcare AI assistant using NHS-based guidance.
+You are a responsible NHS-based healthcare AI assistant.
 
-Use the following NHS context to answer:
+STRICT RULES:
+- Only answer healthcare-related questions.
+- If a question is not healthcare-related, politely refuse.
+- Provide educational information only.
+- Do not diagnose.
+- Do not prescribe medication.
+- For serious symptoms, advise contacting NHS 111 or emergency services.
+
+RESPONSE STYLE:
+- Always give clear, brief, simple answers.
+- Use clean bullet points.
+- Avoid long paragraphs.
+- Only give detailed explanations if the user explicitly asks for more detail.
+
+Use the following NHS context if relevant:
 
 {context_text}
-
-Provide structured educational information only.
-If symptoms suggest emergency, clearly advise urgent care.
 """
                 },
                 {"role": "user", "content": user_message}
@@ -137,10 +195,30 @@ If symptoms suggest emergency, clearly advise urgent care.
 
     reply = result["choices"][0]["message"]["content"]
 
-    emergency_keywords = ["chest pain", "stroke", "heart attack", "can't breathe", "severe bleeding"]
-    is_emergency = any(word in user_message.lower() for word in emergency_keywords)
+    # ✅ Advanced Emergency Detection
+    high_risk_keywords = [
+        "chest pain", "stroke", "heart attack",
+        "unconscious", "severe bleeding",
+        "can't breathe", "not breathing",
+        "suicidal", "overdose", "seizure",
+        "collapse", "paralysis"
+    ]
 
-    confidence = "High" if len(context_docs) > 0 else "Medium"
+    is_emergency = any(word in user_message.lower() for word in high_risk_keywords)
+
+    if is_emergency:
+        reply += (
+            "\n\n⚠️ URGENT: If this is life-threatening, call 999 immediately.\n"
+            "For urgent but non-life-threatening medical concerns, contact NHS 111 for advice."
+        )
+
+    # ✅ Confidence Logic
+    if is_emergency:
+        confidence = "High (Emergency Identified)"
+    elif len(context_docs) > 0:
+        confidence = "High"
+    else:
+        confidence = "Medium"
 
     formatted_sources = [
         {"title": "NHS Guidance", "content": doc}
@@ -154,6 +232,10 @@ If symptoms suggest emergency, clearly advise urgent care.
         "emergency": is_emergency
     }
 
+
+# =============================
+# APPOINTMENT SYSTEM
+# =============================
 
 @app.post("/appointments")
 def create_appointment(
@@ -195,7 +277,11 @@ def get_appointments(
         for appt in appointments
     ]
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
+# =============================
+# ROOT ROUTE
+# =============================
+
+@app.get("/")
+def root():
+    return {"message": "Healthcare AI Backend is running successfully."}
