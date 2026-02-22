@@ -19,7 +19,6 @@ models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# ✅ CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -42,7 +41,7 @@ LLM_MODEL = "llama-3.1-8b-instant"
 
 
 # =============================
-# DATABASE DEPENDENCY
+# DATABASE
 # =============================
 
 def get_db():
@@ -54,7 +53,7 @@ def get_db():
 
 
 # =============================
-# REQUEST MODELS
+# MODELS
 # =============================
 
 class RegisterRequest(BaseModel):
@@ -78,7 +77,7 @@ class AppointmentRequest(BaseModel):
 
 
 # =============================
-# AUTH ENDPOINTS
+# AUTH
 # =============================
 
 @app.post("/register")
@@ -111,7 +110,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 
 
 # =============================
-# CHAT (HEALTHCARE ONLY)
+# CHAT (HEALTHCARE RESTRICTED)
 # =============================
 
 @app.post("/chat")
@@ -119,39 +118,28 @@ async def chat(request: ChatRequest, username: str = Depends(verify_token)):
 
     user_message = request.message
 
-    # ✅ Strict Healthcare Restriction
     healthcare_keywords = [
         "health", "medical", "doctor", "hospital", "symptom",
         "pain", "disease", "condition", "treatment", "medicine",
-        "appointment", "nhs", "mental health", "therapy",
+        "appointment", "nhs", "mental", "therapy",
         "blood", "pressure", "diabetes", "asthma",
-        "infection", "injury", "emergency", "fever",
-        "headache", "breathing", "heart", "stroke",
-        "anxiety", "depression", "injury"
+        "infection", "injury", "emergency", "fever"
     ]
 
     if not any(keyword in user_message.lower() for keyword in healthcare_keywords):
         return {
             "response": (
                 "I am a healthcare assistant and can only respond to medical or healthcare-related questions.\n\n"
-                "For non-health-related inquiries, please use a general-purpose assistant or search engine."
+                "Please use a general assistant for non-health topics."
             ),
             "sources": [],
             "confidence": "Not Applicable",
             "emergency": False
         }
 
-    # ✅ Retrieve NHS Context
     context_docs = llm_select_documents(user_message)
     context_text = "\n\n".join(context_docs)
 
-    # ✅ Detect if user wants detailed explanation
-    detailed_request = any(
-        phrase in user_message.lower()
-        for phrase in ["explain in detail", "more detail", "full explanation", "elaborate"]
-    )
-
-    # ✅ LLM Call
     response = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers=headers,
@@ -163,22 +151,14 @@ async def chat(request: ChatRequest, username: str = Depends(verify_token)):
                     "content": f"""
 You are a responsible NHS-based healthcare AI assistant.
 
-STRICT RULES:
+RULES:
 - Only answer healthcare-related questions.
-- If a question is not healthcare-related, politely refuse.
-- Provide educational information only.
-- Do not diagnose.
-- Do not prescribe medication.
-- For serious symptoms, advise contacting NHS 111 or emergency services.
+- Use brief, clear bullet points.
+- Keep answers short unless user asks for detailed explanation.
+- Do not diagnose or prescribe.
+- Escalate serious cases to NHS 111 or 999.
 
-RESPONSE STYLE:
-- Always give clear, brief, simple answers.
-- Use clean bullet points.
-- Avoid long paragraphs.
-- Only give detailed explanations if the user explicitly asks for more detail.
-
-Use the following NHS context if relevant:
-
+NHS Context:
 {context_text}
 """
                 },
@@ -191,34 +171,29 @@ Use the following NHS context if relevant:
     result = response.json()
 
     if "choices" not in result:
-        raise HTTPException(status_code=500, detail="LLM response error")
+        raise HTTPException(status_code=500, detail="LLM error")
 
     reply = result["choices"][0]["message"]["content"]
 
-    # ✅ Advanced Emergency Detection
     high_risk_keywords = [
         "chest pain", "stroke", "heart attack",
         "unconscious", "severe bleeding",
-        "can't breathe", "not breathing",
-        "suicidal", "overdose", "seizure",
-        "collapse", "paralysis"
+        "can't breathe", "suicidal", "overdose"
     ]
 
     is_emergency = any(word in user_message.lower() for word in high_risk_keywords)
 
     if is_emergency:
         reply += (
-            "\n\n⚠️ URGENT: If this is life-threatening, call 999 immediately.\n"
-            "For urgent but non-life-threatening medical concerns, contact NHS 111 for advice."
+            "\n\n⚠️ URGENT: Call 999 immediately if life-threatening.\n"
+            "For urgent but non-life-threatening medical help, contact NHS 111."
         )
 
-    # ✅ Confidence Logic
-    if is_emergency:
-        confidence = "High (Emergency Identified)"
-    elif len(context_docs) > 0:
-        confidence = "High"
-    else:
-        confidence = "Medium"
+    confidence = (
+        "High (Emergency Identified)"
+        if is_emergency
+        else "High" if context_docs else "Medium"
+    )
 
     formatted_sources = [
         {"title": "NHS Guidance", "content": doc}
@@ -234,7 +209,7 @@ Use the following NHS context if relevant:
 
 
 # =============================
-# APPOINTMENT SYSTEM
+# APPOINTMENTS
 # =============================
 
 @app.post("/appointments")
@@ -278,10 +253,28 @@ def get_appointments(
     ]
 
 
-# =============================
-# ROOT ROUTE
-# =============================
+@app.delete("/appointments/{appointment_id}")
+def delete_appointment(
+    appointment_id: int,
+    username: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.username == username).first()
+
+    appointment = db.query(Appointment).filter(
+        Appointment.id == appointment_id,
+        Appointment.user_id == user.id
+    ).first()
+
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    db.delete(appointment)
+    db.commit()
+
+    return {"message": "Appointment deleted successfully"}
+
 
 @app.get("/")
 def root():
-    return {"message": "Healthcare AI Backend is running successfully."}
+    return {"message": "Healthcare AI Backend Running"}
