@@ -116,7 +116,16 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 @app.post("/chat")
 async def chat(request: ChatRequest, username: str = Depends(verify_token)):
 
-    user_message = request.message
+    user_message = request.message.strip()
+
+
+    if not user_message:
+        return {
+            "response": "Please enter a healthcare-related question.",
+            "sources": [],
+            "confidence": "Not Applicable",
+            "emergency": False
+        }
 
     healthcare_keywords = [
         "health", "medical", "doctor", "hospital", "symptom",
@@ -126,7 +135,31 @@ async def chat(request: ChatRequest, username: str = Depends(verify_token)):
         "infection", "injury", "emergency", "fever"
     ]
 
-    if not any(keyword in user_message.lower() for keyword in healthcare_keywords):
+    # ✅ Use LLM to classify whether question is healthcare-related
+    classification_response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json={
+            "model": LLM_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer only with YES or NO. Is this question related to healthcare, medicine, symptoms, treatment, or NHS services?"
+                },
+                {"role": "user", "content": user_message}
+            ],
+            "temperature": 0
+        }
+    )
+
+    classification_result = classification_response.json()
+
+    if "choices" not in classification_result:
+        raise HTTPException(status_code=500, detail="Classification error")
+
+    is_healthcare = classification_result["choices"][0]["message"]["content"].strip().upper()
+
+    if is_healthcare != "YES":
         return {
             "response": (
                 "I am a healthcare assistant and can only respond to medical or healthcare-related questions.\n\n"
