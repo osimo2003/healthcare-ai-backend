@@ -1,3 +1,4 @@
+from app.database.models import PushSubscription
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -306,6 +307,40 @@ def delete_appointment(
 
     return {"message": "Appointment deleted successfully"}
 
+@app.post("/subscribe")
+def subscribe(
+    subscription: dict,
+    username: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.username == username).first()
+
+    endpoint = subscription.get("endpoint")
+    keys = subscription.get("keys", {})
+    p256dh = keys.get("p256dh")
+    auth = keys.get("auth")
+
+    if not endpoint or not p256dh or not auth:
+        raise HTTPException(status_code=400, detail="Invalid subscription data")
+
+    existing = db.query(PushSubscription).filter(
+        PushSubscription.endpoint == endpoint
+    ).first()
+
+    if existing:
+        return {"message": "Subscription already exists"}
+
+    new_subscription = PushSubscription(
+        endpoint=endpoint,
+        p256dh=p256dh,
+        auth=auth,
+        user_id=user.id
+    )
+
+    db.add(new_subscription)
+    db.commit()
+
+    return {"message": "Subscription saved successfully"}
 
 @app.get("/")
 def root():
