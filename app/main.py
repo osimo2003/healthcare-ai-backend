@@ -1,7 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException
+from app.database.models import PushSubscription
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import requests
 import os
 from dotenv import load_dotenv
@@ -17,17 +21,26 @@ load_dotenv()
 
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+# =============================
+# RATE LIMITER SETUP
+# =============================
+limiter = Limiter(key_func=get_remote_address)
 
+app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# =============================
+# CORS
+# =============================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "https://healthcare-ai-frontend-8wy7.onrender.com"
+        "https://healthlink-access-enterprise-frontend.onrender.com"
     ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -38,6 +51,9 @@ headers = {
 }
 
 LLM_MODEL = "llama-3.1-8b-instant"
+
+# Timeout for all Groq API calls (seconds)
+GROQ_TIMEOUT = 15
 
 
 # =============================
@@ -50,6 +66,17 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# =============================
+# HELPER: Resolve user from token or raise 404
+# =============================
+
+def get_user_or_404(username: str, db: Session) -> User:
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
 
 # =============================
@@ -74,6 +101,16 @@ class AppointmentRequest(BaseModel):
     title: str
     appointment_time: str
     recurring: str = "none"
+
+
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+class PushSubscriptionRequest(BaseModel):
+    endpoint: str
+    keys: PushSubscriptionKeys
 
 
 # =============================
@@ -114,10 +151,13 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 # =============================
 
 @app.post("/chat")
-async def chat(request: ChatRequest, username: str = Depends(verify_token)):
-
+@limiter.limit("20/minute")  
+async def chat(
+    request_obj: Request,
+    request: ChatRequest,
+    username: str = Depends(verify_token)
+):
     user_message = request.message.strip()
-
 
     if not user_message:
         return {
@@ -127,39 +167,39 @@ async def chat(request: ChatRequest, username: str = Depends(verify_token)):
             "emergency": False
         }
 
-    healthcare_keywords = [
-        "health", "medical", "doctor", "hospital", "symptom",
-        "pain", "disease", "condition", "treatment", "medicine",
-        "appointment", "nhs", "mental", "therapy",
-        "blood", "pressure", "diabetes", "asthma",
-        "infection", "injury", "emergency", "fever"
-    ]
 
-    # ✅ Use LLM to classify whether question is healthcare-related
-    classification_response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers=headers,
-        json={
-            "model": LLM_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Answer only with YES or NO. Is this question related to healthcare, medicine, symptoms, treatment, or NHS services?"
-                },
-                {"role": "user", "content": user_message}
-            ],
-            "temperature": 0
-        }
-    )
-
-    classification_result = classification_response.json()
+    #LLM classification
+    try:
+        classification_response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Answer only with YES or NO. Is this question related to healthcare, medicine, symptoms, treatment, or NHS services?"
+                    },
+                    {"role": "user", "content": user_message}
+                ],
+                "temperature": 0
+            },
+            timeout=GROQ_TIMEOUT 
+        )
+        classification_result = classification_response.json()
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Classification service timed out. Please try again.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Classification service unavailable.")
 
     if "choices" not in classification_result:
         raise HTTPException(status_code=500, detail="Classification error")
 
-    is_healthcare = classification_result["choices"][0]["message"]["content"].strip().upper()
+    
+    is_healthcare_raw = classification_result["choices"][0]["message"]["content"].strip().upper()
+    is_healthcare = is_healthcare_raw.startswith("YES")
 
-    if is_healthcare != "YES":
+    if not is_healthcare:
         return {
             "response": (
                 "I am a healthcare assistant and can only respond to medical or healthcare-related questions.\n\n"
@@ -173,15 +213,17 @@ async def chat(request: ChatRequest, username: str = Depends(verify_token)):
     context_docs = llm_select_documents(user_message)
     context_text = "\n\n".join(context_docs)
 
-    response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers=headers,
-        json={
-            "model": LLM_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": f"""
+    #Main LLM response call
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": f"""
 You are a responsible NHS-based healthcare AI assistant.
 
 RULES:
@@ -190,18 +232,23 @@ RULES:
 - Keep answers short unless user asks for detailed explanation.
 - Do not diagnose or prescribe.
 - Escalate serious cases to NHS 111 or 999.
+- If the situation sounds like an emergency, include the word EMERGENCY in your response.
 
 NHS Context:
 {context_text}
 """
-                },
-                {"role": "user", "content": user_message}
-            ],
-            "temperature": 0.3
-        }
-    )
-
-    result = response.json()
+                    },
+                    {"role": "user", "content": user_message}
+                ],
+                "temperature": 0.3
+            },
+            timeout=GROQ_TIMEOUT  
+        )
+        result = response.json()
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Response service timed out. Please try again.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Response service unavailable.")
 
     if "choices" not in result:
         raise HTTPException(status_code=500, detail="LLM error")
@@ -214,7 +261,8 @@ NHS Context:
         "can't breathe", "suicidal", "overdose"
     ]
 
-    is_emergency = any(word in user_message.lower() for word in high_risk_keywords)
+    combined_check = user_message.lower() + " " + reply.lower()
+    is_emergency = any(word in combined_check for word in high_risk_keywords) or "emergency" in reply.lower()
 
     if is_emergency:
         reply += (
@@ -251,11 +299,21 @@ def create_appointment(
     username: str = Depends(verify_token),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.username == username).first()
+   
+    user = get_user_or_404(username, db)
+
+    
+    try:
+        parsed_time = datetime.fromisoformat(request.appointment_time)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid appointment_time format. Use ISO 8601 e.g. 2025-06-01T10:00:00"
+        )
 
     appointment = Appointment(
         title=request.title,
-        appointment_time=datetime.fromisoformat(request.appointment_time),
+        appointment_time=parsed_time,
         recurring=request.recurring,
         user_id=user.id
     )
@@ -271,7 +329,8 @@ def get_appointments(
     username: str = Depends(verify_token),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.username == username).first()
+    
+    user = get_user_or_404(username, db)
 
     appointments = db.query(Appointment).filter(Appointment.user_id == user.id).all()
 
@@ -292,7 +351,8 @@ def delete_appointment(
     username: str = Depends(verify_token),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.username == username).first()
+   
+    user = get_user_or_404(username, db)
 
     appointment = db.query(Appointment).filter(
         Appointment.id == appointment_id,
@@ -307,6 +367,43 @@ def delete_appointment(
 
     return {"message": "Appointment deleted successfully"}
 
+
+# =============================
+# PUSH SUBSCRIPTION
+# =============================
+
+@app.post("/subscribe")
+def subscribe(
+    subscription: PushSubscriptionRequest, 
+    username: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    
+    user = get_user_or_404(username, db)
+
+    existing = db.query(PushSubscription).filter(
+        PushSubscription.endpoint == subscription.endpoint
+    ).first()
+
+    if existing:
+        return {"message": "Subscription already exists"}
+
+    new_subscription = PushSubscription(
+        endpoint=subscription.endpoint,
+        p256dh=subscription.keys.p256dh,
+        auth=subscription.keys.auth,
+        user_id=user.id
+    )
+
+    db.add(new_subscription)
+    db.commit()
+
+    return {"message": "Subscription saved successfully"}
+
+
+# =============================
+# ROOT
+# =============================
 
 @app.get("/")
 def root():
