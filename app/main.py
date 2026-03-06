@@ -36,8 +36,9 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://healthlink-access-enterprise-frontend.onrender.com"
-    ],
+        "https://healthlink-access-enterprise-frontend.onrender.com",
+        "https://healthcare-ai-frontend-8wy7.onrender.com"
+    ],  
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
