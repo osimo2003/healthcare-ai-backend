@@ -179,8 +179,17 @@ async def chat(
                 "model": LLM_MODEL,
                 "messages": [
                     {
-                        "role": "system",
-                        "content": "Answer only with YES or NO. Is this question related to healthcare, medicine, symptoms, treatment, or NHS services?"
+                       "role": "system",
+                       "content": (
+                           "You are a healthcare topic classifier. "
+                           "Answer only YES or NO. "
+                           "Reply YES if the message relates to any of: "
+                           "medical symptoms, conditions, treatments, medications, "
+                           "emergencies, first aid, mental health, NHS services, "
+                           "chest pain, breathing problems, injuries, or general health advice. "
+                           "Reply NO only if the message is completely unrelated to health. "
+                           "When in doubt, reply YES."
+                       )
                     },
                     {"role": "user", "content": user_message}
                 ],
