@@ -153,13 +153,13 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 # =============================
 
 @app.post("/chat")
-@limiter.limit("20/minute")  
+@limiter.limit("20/minute")
 async def chat(
-    request_obj: Request,
-    request: ChatRequest,
+    request: Request,
+    chat_request: ChatRequest,
     username: str = Depends(verify_token)
 ):
-    user_message = request.message.strip()
+    user_message = chat_request.message.strip()
 
     if not user_message:
         return {
